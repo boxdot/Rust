@@ -1,10 +1,14 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ops::{Add, Neg, Sub};
 
+use rand::Rng;
+
 use crate::math::field::{Field, PrimeField};
 use crate::math::quadratic_residue::legendre_symbol;
+
+use super::tonelli_shanks;
 
 /// Elliptic curve defined by `y^2 = x^3 + Ax + B` over a prime field `F` of
 /// characteristic != 2, 3
@@ -42,7 +46,6 @@ impl<F: Field, const A: i64, const B: i64> EllipticCurve<F, A, B> {
     }
 
     /// Affine point
-    ///
     ///
     /// Return `None` if the coordinates are not on the curve
     pub fn new(x: impl Into<F>, y: impl Into<F>) -> Option<Self> {
@@ -167,6 +170,146 @@ impl<const P: u64, const A: i64, const B: i64> EllipticCurve<PrimeField<P>, A, B
             .try_into()
             .expect("invalid legendre cardinality")
     }
+
+    pub fn cardinality_schanks_mestre() -> usize {
+        if P <= 229 {
+            return Self::cardinality_counted_legendre();
+        }
+
+        // init Schanks search
+        let mut rng = rand::thread_rng();
+        let g: PrimeField<P> = loop {
+            let g = rng.gen_range(0..P);
+            if legendre_symbol(g, P) == -1 {
+                let g: i64 = g.try_into().expect("signed overflow");
+                break PrimeField::from_integer(g);
+            }
+        };
+        let W = ((P as f64).sqrt().sqrt() * 2_f64.sqrt()).ceil() as u64;
+        let (c, d) = ((g * g).integer_mul(A), (g * g * g).integer_mul(B));
+
+        // Mestre loop
+        loop {
+            let x: i64 = rng.gen_range(0..P).try_into().expect("signed overflow");
+            let mut x = PrimeField::<P>::from_integer(x);
+            let mut y_square = x * x * x + x.integer_mul(A) + PrimeField::from_integer(B);
+            let sigma = legendre_symbol(y_square.to_integer(), P);
+
+            let twist = if sigma == 0 {
+                continue;
+            } else if sigma == 1 {
+                // trivial twist
+                let a = PrimeField::from_integer(A);
+                let b = PrimeField::from_integer(B);
+                EllipticCurveTwist::new(a, b)
+            } else {
+                // use twist curve
+                x = g * x;
+                EllipticCurveTwist::new(c, d)
+            };
+
+            let p = twist.lift_x::<A, B>(x).expect("legende symbol failed");
+
+            let mut q = EllipticCurve::infinity();
+            let mut baby_steps: Vec<(PrimeField<P>, u64)> = Vec::with_capacity(W as usize);
+            for i in 0..W {
+                q = twist.add_twisted(p, q);
+                baby_steps.push((q.x, i));
+            }
+            // baby_steps.sort_unstable_by(|(a, _), (b, _)| a.to_integer().cmp(&b.to_integer()));
+
+            let wp = twist.add_twisted(q, p);
+            let mut q = EllipticCurve::infinity();
+            let mut giant_steps: Vec<(PrimeField<P>, u64)> = Vec::with_capacity(W as usize + 1);
+            for j in 0..W + 1 {
+                q = twist.add_twisted(wp, q);
+                giant_steps.push((q.x, j));
+            }
+
+            let ((ip, i), (jwp, j)) = match intersect(baby_steps, giant_steps) {
+                Intersection::Exact(s) => s,
+                Intersection::NonUnique => continue,
+            };
+
+            let sign = if twist.add_twisted(ip, jwp).is_infinity() {
+                1
+            } else if twist.add_twisted(ip, -jwp).is_infinity() {
+                -1
+            } else {
+                unreachable!("intersection found invalid point");
+            };
+
+            return P + 1 + i + sign * j * W;
+        }
+    }
+}
+
+struct EllipticCurveTwist<F: Field> {
+    c: F,
+    d: F,
+}
+
+impl<F: Field> EllipticCurveTwist<F> {
+    fn new(a: F, b: F) -> Self {
+        Self { c: a, d: b }
+    }
+
+    fn add_twisted<const A: i64, const B: i64>(
+        &self,
+        p: EllipticCurve<F, A, B>,
+        q: EllipticCurve<F, A, B>,
+    ) -> EllipticCurve<F, A, B> {
+        let (x, y, infinity) = group_law(self.c, (p.x, p.y, p.infinity), (q.x, q.y, q.infinity));
+        EllipticCurve { x, y, infinity }
+    }
+}
+
+impl<const P: u64> EllipticCurveTwist<PrimeField<P>> {
+    fn lift_x<const A: i64, const B: i64>(
+        &self,
+        x: PrimeField<P>,
+    ) -> Option<EllipticCurve<PrimeField<P>, A, B>> {
+        let y_square = x * x * x + self.c * x + self.d;
+        let y_square_int = y_square.to_integer().try_into().expect("unsigned overflow");
+        let y: i64 = tonelli_shanks(y_square_int, P)?
+            .try_into()
+            .expect("unsigned overflow");
+        let y = PrimeField::from_integer(y);
+        Some(EllipticCurve {
+            x,
+            y,
+            infinity: false,
+        })
+    }
+}
+
+// impl<F: Field> Add for DynEllipticCurve<F> {
+//     type Output = Self;
+//
+//     fn add(self, rhs: Self) -> Self::Output {
+//         group_law(, p, q)
+//     }
+// }
+
+fn group_law<F: Field>(a: F, p: (F, F, bool), q: (F, F, bool)) -> (F, F, bool) {
+    let (x0, y0, inf0) = p;
+    let (x1, y1, inf1) = q;
+    if inf0 {
+        (x1, y1, false)
+    } else if inf1 {
+        (x0, y0, false)
+    } else if x0 == x1 && y0 == -y1 {
+        (F::ZERO, F::ZERO, true)
+    } else {
+        let slope = if x0 != x1 {
+            (y0 - y1) / (x0 - x1)
+        } else {
+            ((x0 * x0).integer_mul(3) + a) / y0.integer_mul(2)
+        };
+        let x = slope * slope - x0 - x1;
+        let y = -y0 + slope * (x0 - x);
+        (x, y, false)
+    }
 }
 
 /// Group law
@@ -174,23 +317,12 @@ impl<F: Field, const A: i64, const B: i64> Add for EllipticCurve<F, A, B> {
     type Output = Self;
 
     fn add(self, p: Self) -> Self::Output {
-        if self.infinity {
-            p
-        } else if p.infinity {
-            self
-        } else if self.x == p.x && self.y == -p.y {
-            // mirrored
-            Self::infinity()
-        } else {
-            let slope = if self.x != p.x {
-                (self.y - p.y) / (self.x - p.x)
-            } else {
-                ((self.x * self.x).integer_mul(3) + F::from_integer(A)) / self.y.integer_mul(2)
-            };
-            let x = slope * slope - self.x - p.x;
-            let y = -self.y + slope * (self.x - x);
-            Self::new(x, y).expect("elliptic curve group law failed")
-        }
+        let (x, y, infinity) = group_law(
+            F::from_integer(A),
+            (self.x, self.y, self.infinity),
+            (p.x, p.y, p.infinity),
+        );
+        Self { x, y, infinity }
     }
 }
 
